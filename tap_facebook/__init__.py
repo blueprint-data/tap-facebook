@@ -1024,6 +1024,27 @@ def main_impl():
             raise_from(SingerDiscoveryError, fb_error)
     elif args.properties:
         catalog = Catalog.from_dict(args.properties)
+
+        # Auto-select all streams if none are explicitly selected.
+        # Some orchestrators (e.g. Meltano) may pass a --properties
+        # catalog without selected=true markers on first runs.
+        # Without this fallback the tap would silently produce
+        # 0 records.
+        if not any(s.is_selected() for s in catalog.streams):
+            LOGGER.warning(
+                "No streams were explicitly selected in the catalog. "
+                "Auto-selecting all streams and properties."
+            )
+            for stream_entry in catalog.streams:
+                compiled = metadata.to_map(stream_entry.metadata)
+                compiled = metadata.write(compiled, (), "selected", True)
+                for breadcrumb in list(compiled.keys()):
+                    if len(breadcrumb) >= 2:
+                        compiled = metadata.write(
+                            compiled, breadcrumb, "selected", True
+                        )
+                stream_entry.metadata = metadata.to_list(compiled)
+
         try:
             do_sync(account, catalog, args.state)
         except FacebookError as fb_error:

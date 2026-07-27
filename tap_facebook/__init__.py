@@ -1022,11 +1022,14 @@ def main_impl():
             do_discover()
         except FacebookError as fb_error:
             raise_from(SingerDiscoveryError, fb_error)
-    elif args.properties:
-        catalog = Catalog.from_dict(args.properties)
+    elif args.properties or args.catalog:
+        if args.properties:
+            catalog = Catalog.from_dict(args.properties)
+        else:
+            catalog = args.catalog
 
         # Auto-select all streams if none are explicitly selected.
-        # Some orchestrators (e.g. Meltano) may pass a --properties
+        # Some orchestrators (e.g. Meltano) may pass --catalog or --properties
         # catalog without selected=true markers on first runs.
         # Without this fallback the tap would silently produce
         # 0 records.

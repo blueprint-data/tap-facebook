@@ -47,7 +47,8 @@ from facebook_business.exceptions import (
     FacebookBadObjectError,
 )
 
-from requests.exceptions import ConnectionError, Timeout
+from requests.exceptions import ConnectionError, Timeout, ChunkedEncodingError
+from urllib3.exceptions import ProtocolError
 
 API = None
 
@@ -117,6 +118,13 @@ def is_transient_facebook_error(exception):
         or isinstance(exception, Timeout)
         or isinstance(exception, ConnectionError)
         or isinstance(exception, AttributeError)
+        # ChunkedEncodingError is a sibling of ConnectionError under
+        # requests.exceptions.RequestException (not a subclass of it), so it
+        # needs its own check. ProtocolError is urllib3's lower-level
+        # equivalent (e.g. IncompleteRead) that can surface the same way.
+        # Both are transient network truncations, not API errors.
+        or isinstance(exception, ChunkedEncodingError)
+        or isinstance(exception, ProtocolError)
     ):
         return True
     elif isinstance(exception, FacebookRequestError):
@@ -180,8 +188,236 @@ def retry_on_summary_param_error(backoff_type, exception, **wait_gen_kwargs):
 original_call = FacebookAdsApi.call
 
 
+# --- Calculated, bounded rate-limit pacing --------------------------------
+#
+# Meta's Marketing API tells callers exactly how long a rate-limit window has
+# left to reset, via two response headers surfaced on FacebookRequestError
+# (confirmed against https://developers.facebook.com/docs/graph-api/overview/rate-limiting/,
+# and via https://developers.facebook.com/docs/marketing-api/overview/rate-limiting/
+# for the ad-account-specific header):
+#
+#   X-Ad-Account-Usage        -> {"acc_id_util_pct": <0-100>,
+#                                  "reset_time_duration": <SECONDS>, ...}
+#   X-Business-Use-Case-Usage -> {"<business_id>": [{"estimated_time_to_regain_access": <MINUTES>,
+#                                                      "call_count": <0-100>, ...}]}
+#
+# Using that real countdown instead of a guessed exponential wait is strictly
+# better -- but it must never be allowed to hang a task. Three independent
+# bounds apply on top of each other:
+#   1. Any single header-derived wait is capped at RATE_LIMIT_MAX_WAIT_SECONDS.
+#   2. The retry loop's total wall-clock time (waits *and* the call attempts
+#      themselves) is capped at RATE_LIMIT_MAX_TOTAL_WAIT_SECONDS via
+#      backoff's own `max_time`.
+#   3. `max_tries=5` remains the pre-existing hard stop on attempt count.
+# If no usable header is found, behavior is unchanged from before this
+# feature: the original exponential sequence (5/10/20/40s).
+#
+# VERIFIED (via facebook_business/api.py source + docs above): reset_time_duration
+# is in seconds, estimated_time_to_regain_access is in minutes; http_headers()/
+# response.headers() are populated straight from requests.Response.headers (a
+# case-insensitive dict) on real traffic.
+# INFERRED / best-effort (not confirmed against live traffic in this pass): the
+# exact header value is valid double-quoted JSON as Meta's docs render it; the
+# defensive case-insensitive lookup and json.loads try/except below exist
+# specifically to degrade to the exponential fallback rather than crash if
+# either assumption is ever wrong.
+RATE_LIMIT_MAX_WAIT_SECONDS = 120
+RATE_LIMIT_MAX_TOTAL_WAIT_SECONDS = 180
+RATE_LIMIT_UTILIZATION_THROTTLE_PCT = 80.0
+RATE_LIMIT_PROACTIVE_SLEEP_SECONDS = 1.0
+
+
+def _get_header_case_insensitive(headers, name):
+    """
+    Looks up a header by name regardless of casing.
+
+    On real traffic, `FacebookRequestError.http_headers()` / `FacebookResponse.headers()`
+    are populated straight from `requests.Response.headers` -- a case-insensitive
+    `requests.structures.CaseInsensitiveDict` -- so a plain `.get(name)` already
+    works there. This falls back to a manual case-insensitive scan so it also
+    behaves correctly against a vanilla dict with different key casing (e.g. a
+    test double, or a future SDK change).
+    """
+    if not headers:
+        return None
+    try:
+        value = headers.get(name)
+    except AttributeError:
+        return None
+    if value is not None:
+        return value
+    lowered_name = name.lower()
+    try:
+        items = headers.items()
+    except AttributeError:
+        return None
+    for key, val in items:
+        if isinstance(key, str) and key.lower() == lowered_name:
+            return val
+    return None
+
+
+def _parse_json_header(value):
+    """
+    Meta's usage headers are documented as JSON. Tolerates a value that's
+    already a dict (e.g. a test double), and never raises -- returns None for
+    anything unparseable so callers can fall back cleanly.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _first_finite_nonnegative_number(*candidates):
+    """Returns the first candidate that parses as a finite, non-negative number."""
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            number = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if number != number or number in (float("inf"), float("-inf")):
+            continue  # NaN / inf guard
+        if number >= 0:
+            return number
+    return None
+
+
+def _reset_wait_seconds_from_facebook_error(exception):
+    """
+    Best-effort read of Meta's own rate-limit countdown off a FacebookRequestError,
+    instead of guessing with blind exponential backoff.
+
+    Checks, in order:
+      1. X-Ad-Account-Usage -> reset_time_duration (documented in SECONDS)
+      2. X-Business-Use-Case-Usage -> estimated_time_to_regain_access
+         (documented in MINUTES -- converted to seconds here)
+
+    Returns a wait in seconds, capped at RATE_LIMIT_MAX_WAIT_SECONDS, or None
+    if no usable signal was found (caller should fall back to exponential
+    backoff).
+    """
+    if not isinstance(exception, FacebookRequestError):
+        return None
+    try:
+        headers = exception.http_headers()
+    except Exception:
+        return None
+    if not headers:
+        return None
+
+    acc_usage = _parse_json_header(
+        _get_header_case_insensitive(headers, "x-ad-account-usage")
+    )
+    if isinstance(acc_usage, dict):
+        wait_seconds = _first_finite_nonnegative_number(
+            acc_usage.get("reset_time_duration")
+        )
+        if wait_seconds is not None:
+            return min(wait_seconds, RATE_LIMIT_MAX_WAIT_SECONDS)
+
+    buc_usage = _parse_json_header(
+        _get_header_case_insensitive(headers, "x-business-use-case-usage")
+    )
+    if isinstance(buc_usage, dict):
+        candidates = []
+        for entries in buc_usage.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    candidates.append(entry.get("estimated_time_to_regain_access"))
+        wait_minutes = _first_finite_nonnegative_number(*candidates)
+        if wait_minutes is not None:
+            return min(wait_minutes * 60, RATE_LIMIT_MAX_WAIT_SECONDS)
+
+    return None
+
+
+def _rate_limit_aware_expo(base=2, factor=1, max_value=None):
+    """
+    `wait_gen` for call_with_retry's backoff.on_exception.
+
+    Per backoff's own documented pattern for exception-aware waits (see
+    `backoff._wait_gen.runtime`), the retry loop calls `wait.send(exception)`
+    on every retry, so the exception that triggered the retry is available
+    here to inspect. When it's a FacebookRequestError carrying a parseable
+    Meta usage header, this waits exactly as long as Meta says the window
+    needs (bounded -- see `_reset_wait_seconds_from_facebook_error`).
+    Otherwise it falls back to the pre-existing exponential sequence
+    (factor * base**n), unchanged from before this pacing feature was added.
+    """
+    exception = yield
+    n = 0
+    while True:
+        header_wait = _reset_wait_seconds_from_facebook_error(exception)
+        if header_wait is not None:
+            exception = yield header_wait
+        else:
+            fallback = factor * base**n
+            if max_value is not None:
+                fallback = min(fallback, max_value)
+            exception = yield fallback
+        n += 1
+
+
+def _throttle_if_near_rate_limit(response):
+    """
+    Proactive companion to the reactive header-aware wait above: on every
+    SUCCESSFUL call, peek at `acc_id_util_pct` (ad account utilization, 0-100)
+    off X-Ad-Account-Usage. Once utilization crosses ~80% (a community-documented
+    heuristic, not an official Meta threshold -- Meta only documents that 100%
+    yields error code 17), insert one short pause before returning, so we ease
+    off before actually getting throttled instead of only reacting after the fact.
+
+    Deliberately a small fixed sleep rather than a scaled one: `acc_id_util_pct`
+    tells us how close we are to the ceiling, not how long until it resets, so
+    there's no "exact" number to calculate from the way there is for
+    `reset_time_duration` -- scaling this sleep by utilization would just be
+    reintroducing a guess.
+
+    Never raises: this must not turn a successful call into a failure, so any
+    unexpected shape (e.g. a plain value with no `.headers()`, as in tests
+    that stub `original_call` to return a bare string) is swallowed silently.
+    """
+    try:
+        headers = response.headers()
+    except Exception:
+        return
+    acc_usage = _parse_json_header(
+        _get_header_case_insensitive(headers, "x-ad-account-usage")
+    )
+    if not isinstance(acc_usage, dict):
+        return
+    util_pct = _first_finite_nonnegative_number(acc_usage.get("acc_id_util_pct"))
+    if util_pct is not None and util_pct >= RATE_LIMIT_UTILIZATION_THROTTLE_PCT:
+        LOGGER.info(
+            "Ad account usage at %.1f%% (>= %.0f%% threshold); pausing %.1fs before next call.",
+            util_pct,
+            RATE_LIMIT_UTILIZATION_THROTTLE_PCT,
+            RATE_LIMIT_PROACTIVE_SLEEP_SECONDS,
+        )
+        time.sleep(RATE_LIMIT_PROACTIVE_SLEEP_SECONDS)
+
+
 @retry_on_summary_param_error(
-    backoff.expo, (FacebookRequestError), max_tries=5, factor=5
+    _rate_limit_aware_expo,
+    (
+        FacebookRequestError,
+        ChunkedEncodingError,
+        ConnectionError,
+        ProtocolError,
+        Timeout,
+    ),
+    max_tries=5,
+    factor=5,
+    max_time=RATE_LIMIT_MAX_TOTAL_WAIT_SECONDS,
 )
 def call_with_retry(
     self,
@@ -196,7 +432,7 @@ def call_with_retry(
     """
     Adding the retry decorator on the original function call
     """
-    return original_call(
+    response = original_call(
         self,
         method,
         path,
@@ -206,6 +442,8 @@ def call_with_retry(
         url_override,
         api_version,
     )
+    _throttle_if_near_rate_limit(response)
+    return response
 
 
 FacebookAdsApi.call = call_with_retry
@@ -1310,7 +1548,20 @@ def main_impl():
             request_timeout = REQUEST_TIMEOUT  # If value is 0,"0","" or not passed then set default to 300 seconds.
 
         global API
-        API = FacebookAdsApi.init(access_token=access_token, timeout=request_timeout)
+        # crash_log=False disables the SDK's crash-reporter (facebook_business.crashreporter),
+        # which is armed by default (api.py's init() defaults crash_log=True) and patches
+        # sys.excepthook. On an uncaught non-FacebookError exception (e.g. a transient
+        # requests.exceptions.ChunkedEncodingError), it POSTs a crash report to Facebook's
+        # /instruments endpoint using node_id=app_id -- but this tap never passes app_id to
+        # init(), so that POST always fails with a real Facebook 400 (GraphMethodException,
+        # error_subcode 33, "Object with ID 'None' does not exist"). That failing request also
+        # goes through call_with_retry (FacebookAdsApi.call is monkeypatched globally), and
+        # is_transient_facebook_error's subcode-33 check (added for an unrelated AdsInsights
+        # race condition) treats it as retryable, wasting ~75s retrying the SDK's own broken
+        # self-diagnostic call before the original exception is finally re-raised.
+        API = FacebookAdsApi.init(
+            access_token=access_token, timeout=request_timeout, crash_log=False
+        )
         user = fb_user.User(fbid="me")
 
         accounts = user.get_ad_accounts()

@@ -7,6 +7,7 @@ from facebook_business.exceptions import FacebookBadObjectError
 from facebook_business import FacebookAdsApi
 from facebook_business.api import FacebookResponse
 from tap_facebook import AdCreative, AdsInsights
+from tap_facebook import call_with_retry
 from facebook_business.adobjects.adaccount import AdAccount
 import requests
 from requests.models import Response
@@ -327,3 +328,56 @@ class TestInsightJobs(unittest.TestCase):
         self.assertIn("There was an error running your report.", error_str)
         # Should fail immediately — no retries on job failure
         self.assertEqual(1, mocked_api_get.call_count)
+
+
+@patch("time.sleep")
+class TestCallWithRetryRateLimit(unittest.TestCase):
+    """`call_with_retry` is the function patched onto `FacebookAdsApi.call`, the single
+    choke point every Facebook SDK call passes through -- including page 2+ of every
+    paginated stream, since `Cursor.load_next_page()` calls `self._api.call(...)`
+    directly and bypasses the per-stream `retry_pattern` decorator entirely.
+
+    Previously `call_with_retry` only retried a narrow summary-param regex match, so a
+    rate limit error (Facebook error code 17) hit while paginating would crash instead
+    of retrying, even though the exact same error is retried when it happens on page 1
+    (via `retry_pattern` on the outer method). These tests assert `call_with_retry`
+    itself now retries on error code 17.
+    """
+
+    def _rate_limit_error(self):
+        return FacebookRequestError(
+            message='User request limit reached',
+            request_context={"": Mock()},
+            http_status=400,
+            http_headers=Mock(),
+            body={"error": {"code": 17, "message": "User request limit reached"}},
+        )
+
+    @patch("tap_facebook.original_call")
+    def test_retries_on_rate_limit_code_17_then_succeeds(self, mocked_original_call, mocked_sleep):
+        """Two consecutive code 17 rate limit errors followed by a successful response
+        should be retried and eventually return the successful result.
+        """
+        mocked_original_call.side_effect = [
+            self._rate_limit_error(),
+            self._rate_limit_error(),
+            "success",
+        ]
+
+        result = call_with_retry(Mock(), "GET", "/some/path")
+
+        self.assertEqual("success", result)
+        self.assertEqual(3, mocked_original_call.call_count)
+
+    @patch("tap_facebook.original_call")
+    def test_gives_up_after_max_tries_on_persistent_rate_limit(self, mocked_original_call, mocked_sleep):
+        """If the rate limit error never clears, `call_with_retry` should give up
+        after the max_tries configured for the decorator (5), matching the other
+        retry-until-giveup tests in this module.
+        """
+        mocked_original_call.side_effect = self._rate_limit_error()
+
+        with self.assertRaises(FacebookRequestError):
+            call_with_retry(Mock(), "GET", "/some/path")
+
+        self.assertEqual(5, mocked_original_call.call_count)

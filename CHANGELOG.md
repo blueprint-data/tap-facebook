@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.26.5
+  * Merge the `v1.26.1`-`v1.26.4` fix lineage into `master`:
+    - Support bool `include_deleted` config value (Meltano YAML passes a JSON boolean, which previously crashed with `AttributeError: 'bool' object has no attribute 'lower'`)
+    - Retry on rate limit errors (Facebook error code 17) instead of aborting immediately
+    - Reduce API call batches per stream (`iter_delivery_info_filter` sub-list length raised from 3 to 7), cutting total API volume when `include_deleted` is enabled
+  * Fix rate-limit retry gap during pagination: extract a shared `is_transient_facebook_error()` condition used by both `call_with_retry` (the global `FacebookAdsApi.call` monkeypatch every SDK call passes through, including page 2+ of every paginated stream via `Cursor.load_next_page()`) and `retry_pattern` (applied per-stream to the call that creates the cursor). Previously, a code 17 rate limit error retried fine on page 1 but crashed immediately when hit on a later page, since `call_with_retry` only retried a narrow summary-param regex match
+
 ## 1.26.0
   * Add `ads_insights_comscore_market` stream to replace deprecated DMA breakdown
   * Deprecate `ads_insights_dma` stream (Meta removed DMA support on June 22, 2026) [#270](https://github.com/singer-io/tap-facebook/pull/270)

@@ -101,11 +101,53 @@ LOGGER = singer.get_logger()
 CONFIG = {}
 
 
+def is_transient_facebook_error(exception):
+    """
+    Shared retry condition for transient Facebook API errors: connection issues,
+    rate limiting (error code 17), and other errors known to succeed on retry.
+
+    This is used both by `call_with_retry` (the global monkeypatch wrapping every
+    FacebookAdsApi.call, including SDK-internal pagination via Cursor.load_next_page)
+    and by `retry_pattern` (applied per-stream to the methods that create cursors),
+    so that a transient error is retried consistently regardless of which layer it
+    surfaces in.
+    """
+    if (
+        isinstance(exception, FacebookBadObjectError)
+        or isinstance(exception, Timeout)
+        or isinstance(exception, ConnectionError)
+        or isinstance(exception, AttributeError)
+    ):
+        return True
+    elif isinstance(exception, FacebookRequestError):
+        return (
+            exception.api_transient_error()
+            or exception.api_error_code() == 17
+            or exception.api_error_subcode() == 99
+            or exception.http_status() in (500, 503)
+            # This subcode corresponds to a race condition between AdsInsights job creation and polling
+            or exception.api_error_subcode() == 33
+        )
+    elif isinstance(exception, InsightsJobTimeout):
+        return True
+    elif (
+        isinstance(exception, TypeError)
+        and str(exception) == "string indices must be integers"
+    ):
+        return True
+    return False
+
+
 def retry_on_summary_param_error(backoff_type, exception, **wait_gen_kwargs):
     """
     At times, the Facebook Graph API exhibits erratic behavior,
     triggering errors related to the Summary parameter with a status code of 400.
     However, upon retrying, the API functions as expected.
+
+    This also retries any other transient Facebook API error (see
+    `is_transient_facebook_error`), since `call_with_retry` is the single choke
+    point every FacebookAdsApi call passes through -- including page 2+ of every
+    paginated stream, which bypasses the per-stream `retry_pattern` decorator.
     """
 
     def log_retry_attempt(details):
@@ -119,11 +161,11 @@ def retry_on_summary_param_error(backoff_type, exception, **wait_gen_kwargs):
     def should_retry_api_error(exception):
         # Define the regular expression pattern
         pattern = r"\(#100\) Cannot include [\w, ]+ in summary param because they weren\'t there while creating the report run(?:\. All available values are: )?"
-        if isinstance(exception, FacebookRequestError):
-            return exception.http_status() == 400 and re.match(
-                pattern, exception._error["message"]
-            )
-        return False
+        return is_transient_facebook_error(exception) or (
+            isinstance(exception, FacebookRequestError)
+            and exception.http_status() == 400
+            and re.match(pattern, exception._error["message"])
+        )
 
     return backoff.on_exception(
         backoff_type,
@@ -254,30 +296,7 @@ def retry_pattern(backoff_type, exception, **wait_gen_kwargs):
             LOGGER.info("TypeError due to bad JSON response")
 
     def should_retry_api_error(exception):
-        if (
-            isinstance(exception, FacebookBadObjectError)
-            or isinstance(exception, Timeout)
-            or isinstance(exception, ConnectionError)
-            or isinstance(exception, AttributeError)
-        ):
-            return True
-        elif isinstance(exception, FacebookRequestError):
-            return (
-                exception.api_transient_error()
-                or exception.api_error_code() == 17
-                or exception.api_error_subcode() == 99
-                or exception.http_status() in (500, 503)
-                # This subcode corresponds to a race condition between AdsInsights job creation and polling
-                or exception.api_error_subcode() == 33
-            )
-        elif isinstance(exception, InsightsJobTimeout):
-            return True
-        elif (
-            isinstance(exception, TypeError)
-            and str(exception) == "string indices must be integers"
-        ):
-            return True
-        return False
+        return is_transient_facebook_error(exception)
 
     return backoff.on_exception(
         backoff_type,

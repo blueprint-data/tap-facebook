@@ -668,3 +668,75 @@ class TestThrottleIfNearRateLimit(unittest.TestCase):
         tap_facebook._throttle_if_near_rate_limit("success")
 
         mocked_sleep.assert_not_called()
+
+    def _response_with_buc_usage(self, call_count):
+        response = Mock()
+        buc_header = json.dumps(
+            {"123456": [{"call_count": call_count, "estimated_time_to_regain_access": 0}]}
+        )
+        response.headers.return_value = {"x-business-use-case-usage": buc_header}
+        return response
+
+    @patch("time.sleep")
+    def test_pauses_based_on_business_use_case_usage_when_ad_account_header_absent(
+        self, mocked_sleep
+    ):
+        """Most of this tap's streams are ads_insights variants, governed by
+        the Business Use Case formula rather than the general ad-account one
+        -- the proactive throttle must react to X-Business-Use-Case-Usage
+        too, not only X-Ad-Account-Usage.
+        """
+        response = self._response_with_buc_usage(call_count=85)
+
+        tap_facebook._throttle_if_near_rate_limit(response)
+
+        mocked_sleep.assert_called_once_with(
+            tap_facebook.RATE_LIMIT_PROACTIVE_SLEEP_SECONDS
+        )
+
+    @patch("time.sleep")
+    def test_no_pause_when_business_use_case_usage_below_threshold(self, mocked_sleep):
+        response = self._response_with_buc_usage(call_count=10)
+
+        tap_facebook._throttle_if_near_rate_limit(response)
+
+        mocked_sleep.assert_not_called()
+
+    @patch("time.sleep")
+    def test_longer_pause_when_utilization_crosses_high_threshold(self, mocked_sleep):
+        """Escalating tiers: >=95% gets the longer pause, not the short one --
+        a large first full sync should back off more the closer it gets to
+        the ceiling instead of applying the same tiny pause all the way up
+        to 100%.
+        """
+        usage_header = json.dumps({"acc_id_util_pct": 97, "reset_time_duration": 0})
+        response = self._response_with_usage(usage_header)
+
+        tap_facebook._throttle_if_near_rate_limit(response)
+
+        mocked_sleep.assert_called_once_with(
+            tap_facebook.RATE_LIMIT_HIGH_PROACTIVE_SLEEP_SECONDS
+        )
+
+    @patch("time.sleep")
+    def test_uses_whichever_header_reports_higher_utilization(self, mocked_sleep):
+        """When both headers are present, the higher of the two utilization
+        signals should govern the pause tier -- an insights-heavy call
+        pushing Business Use Case usage past 95% must not be masked by a
+        comfortably low Ad Account usage number.
+        """
+        response = Mock()
+        response.headers.return_value = {
+            "x-ad-account-usage": json.dumps(
+                {"acc_id_util_pct": 30, "reset_time_duration": 0}
+            ),
+            "x-business-use-case-usage": json.dumps(
+                {"123456": [{"call_count": 96, "estimated_time_to_regain_access": 0}]}
+            ),
+        }
+
+        tap_facebook._throttle_if_near_rate_limit(response)
+
+        mocked_sleep.assert_called_once_with(
+            tap_facebook.RATE_LIMIT_HIGH_PROACTIVE_SLEEP_SECONDS
+        )

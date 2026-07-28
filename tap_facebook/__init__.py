@@ -225,6 +225,8 @@ RATE_LIMIT_MAX_WAIT_SECONDS = 120
 RATE_LIMIT_MAX_TOTAL_WAIT_SECONDS = 180
 RATE_LIMIT_UTILIZATION_THROTTLE_PCT = 80.0
 RATE_LIMIT_PROACTIVE_SLEEP_SECONDS = 1.0
+RATE_LIMIT_HIGH_UTILIZATION_PCT = 95.0
+RATE_LIMIT_HIGH_PROACTIVE_SLEEP_SECONDS = 10.0
 
 
 def _get_header_case_insensitive(headers, name):
@@ -367,20 +369,64 @@ def _rate_limit_aware_expo(base=2, factor=1, max_value=None):
         n += 1
 
 
+def _current_utilization_pct(headers):
+    """
+    Highest reported utilization percentage across BOTH usage dimensions Meta
+    exposes, so a stream that's mostly ads_insights (governed by the
+    Business Use Case formula) gets the same proactive protection as one
+    governed by the general ad-account formula:
+
+      - X-Ad-Account-Usage.acc_id_util_pct (Ads Management-style calls)
+      - X-Business-Use-Case-Usage[*][*].call_count (Ads Insights-style calls;
+        one entry per business id, each 0-100)
+
+    Returns the max of whatever is present, or None if neither header is
+    usable.
+    """
+    candidates = []
+
+    acc_usage = _parse_json_header(
+        _get_header_case_insensitive(headers, "x-ad-account-usage")
+    )
+    if isinstance(acc_usage, dict):
+        candidates.append(_first_finite_nonnegative_number(acc_usage.get("acc_id_util_pct")))
+
+    buc_usage = _parse_json_header(
+        _get_header_case_insensitive(headers, "x-business-use-case-usage")
+    )
+    if isinstance(buc_usage, dict):
+        for entries in buc_usage.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    candidates.append(_first_finite_nonnegative_number(entry.get("call_count")))
+
+    candidates = [c for c in candidates if c is not None]
+    return max(candidates) if candidates else None
+
+
 def _throttle_if_near_rate_limit(response):
     """
     Proactive companion to the reactive header-aware wait above: on every
-    SUCCESSFUL call, peek at `acc_id_util_pct` (ad account utilization, 0-100)
-    off X-Ad-Account-Usage. Once utilization crosses ~80% (a community-documented
-    heuristic, not an official Meta threshold -- Meta only documents that 100%
-    yields error code 17), insert one short pause before returning, so we ease
-    off before actually getting throttled instead of only reacting after the fact.
+    SUCCESSFUL call, peek at the highest reported utilization across both
+    X-Ad-Account-Usage (Ads Management) and X-Business-Use-Case-Usage (Ads
+    Insights -- most of this tap's streams are ads_insights variants, so
+    this dimension matters at least as much as the ad-account one). Once
+    utilization crosses a threshold, insert a pause before returning, so we
+    ease off before actually getting throttled instead of only reacting
+    after the fact -- this matters most on a first full sync, which makes
+    far more calls than an incremental run and would otherwise climb toward
+    the ceiling steadily throughout.
 
-    Deliberately a small fixed sleep rather than a scaled one: `acc_id_util_pct`
-    tells us how close we are to the ceiling, not how long until it resets, so
-    there's no "exact" number to calculate from the way there is for
-    `reset_time_duration` -- scaling this sleep by utilization would just be
-    reintroducing a guess.
+    Escalating, not scaled: two fixed tiers (a short pause starting at 80%,
+    a longer one from 95%) rather than a continuous function of utilization.
+    Meta's percentage tells us how close we are to the ceiling, not how long
+    until it resets, so there's no "exact" number to calculate the way there
+    is for `reset_time_duration` -- a smooth scale would just be reintroducing
+    a guess. Two fixed, deliberately conservative tiers still let a large
+    first-sync back off increasingly as it approaches 100% instead of
+    cruising at full speed until it slams into `code 17`.
 
     Never raises: this must not turn a successful call into a failure, so any
     unexpected shape (e.g. a plain value with no `.headers()`, as in tests
@@ -390,20 +436,22 @@ def _throttle_if_near_rate_limit(response):
         headers = response.headers()
     except Exception:
         return
-    acc_usage = _parse_json_header(
-        _get_header_case_insensitive(headers, "x-ad-account-usage")
-    )
-    if not isinstance(acc_usage, dict):
+    util_pct = _current_utilization_pct(headers)
+    if util_pct is None:
         return
-    util_pct = _first_finite_nonnegative_number(acc_usage.get("acc_id_util_pct"))
-    if util_pct is not None and util_pct >= RATE_LIMIT_UTILIZATION_THROTTLE_PCT:
-        LOGGER.info(
-            "Ad account usage at %.1f%% (>= %.0f%% threshold); pausing %.1fs before next call.",
-            util_pct,
-            RATE_LIMIT_UTILIZATION_THROTTLE_PCT,
-            RATE_LIMIT_PROACTIVE_SLEEP_SECONDS,
-        )
-        time.sleep(RATE_LIMIT_PROACTIVE_SLEEP_SECONDS)
+    if util_pct >= RATE_LIMIT_HIGH_UTILIZATION_PCT:
+        sleep_seconds = RATE_LIMIT_HIGH_PROACTIVE_SLEEP_SECONDS
+    elif util_pct >= RATE_LIMIT_UTILIZATION_THROTTLE_PCT:
+        sleep_seconds = RATE_LIMIT_PROACTIVE_SLEEP_SECONDS
+    else:
+        return
+    LOGGER.info(
+        "Ad account usage at %.1f%% (>= %.0f%% threshold); pausing %.1fs before next call.",
+        util_pct,
+        RATE_LIMIT_UTILIZATION_THROTTLE_PCT if sleep_seconds == RATE_LIMIT_PROACTIVE_SLEEP_SECONDS else RATE_LIMIT_HIGH_UTILIZATION_PCT,
+        sleep_seconds,
+    )
+    time.sleep(sleep_seconds)
 
 
 @retry_on_summary_param_error(

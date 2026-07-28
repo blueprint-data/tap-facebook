@@ -1187,26 +1187,38 @@ class AdsInsights(Stream):
             buffered_start_date = min_start_date
 
         thirteen_months_ago = pendulum.today().subtract(months=13)
-        is_old_data = buffered_start_date < thirteen_months_ago
-        if is_old_data and "reach" in self.fields() and self.breakdowns:
-            LOGGER.warning(
-                "Skipping reach field for %s with breakdowns older than 13 months (%s).",
-                self.catalog_entry.tap_stream_id,
-                buffered_start_date.to_date_string(),
-            )
 
         end_date = pendulum.now()
         if CONFIG.get("end_date"):
             end_date = pendulum.parse(CONFIG.get("end_date"))
 
+        # Reach is unsupported by Facebook for breakdown queries older than 13
+        # months; must be re-checked per day (not once for the whole range),
+        # since a range starting >13 months ago still yields many recent days
+        # for which reach IS valid. Previously this only logged a warning and
+        # never actually removed the field, so old-data requests kept sending
+        # it and risked Facebook rejecting them.
+        warned_reach_skip = False
+
         # Some automatic fields (primary-keys) cannot be used as 'fields' query params.
         while buffered_start_date <= end_date:
+            day_fields = self.fields().difference(self.invalid_insights_fields)
+            is_old_day = buffered_start_date < thirteen_months_ago
+            if is_old_day and "reach" in day_fields and self.breakdowns:
+                day_fields = day_fields.difference({"reach"})
+                if not warned_reach_skip:
+                    LOGGER.warning(
+                        "Skipping reach field for %s with breakdowns older than 13 months (starting %s).",
+                        self.catalog_entry.tap_stream_id,
+                        buffered_start_date.to_date_string(),
+                    )
+                    warned_reach_skip = True
             yield {
                 "level": self.level,
                 "action_breakdowns": list(self.action_breakdowns),
                 "breakdowns": list(self.breakdowns),
                 "limit": self.limit,
-                "fields": list(self.fields().difference(self.invalid_insights_fields)),
+                "fields": list(day_fields),
                 "time_increment": self.time_increment,
                 "action_attribution_windows": list(self.action_attribution_windows),
                 "time_ranges": [

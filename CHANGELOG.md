@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.26.8
+  * Fix `AdsInsights.job_params()` never actually excluding the `reach` field for breakdown queries older than 13 months, despite logging that it would -- `invalid_insights_fields` (the list actually subtracted from the requested fields) never included `reach`, so old-data requests kept sending it and risked Facebook rejecting them. The check is now also done per-day inside the loop (not once for the whole range), since a range starting >13 months ago still yields many recent days for which `reach` is valid and should still be requested.
+
 ## 1.26.7
   * Extend the proactive rate-limit throttle to also read `X-Business-Use-Case-Usage.*.call_count` (Ads Insights), not just `X-Ad-Account-Usage.acc_id_util_pct` (Ads Management) -- most of this tap's streams are `ads_insights` variants governed by the Business Use Case formula, so they previously had no proactive backoff at all, only reactive retry-after-failure. When both headers are present, the higher of the two utilization signals governs.
   * Make the proactive pause escalate in two tiers instead of one flat pause: a short pause from 80% utilization (unchanged), and a longer pause from 95% -- so a large first full sync backs off increasingly as it approaches the ceiling instead of cruising at full speed until it hits `code 17`.
